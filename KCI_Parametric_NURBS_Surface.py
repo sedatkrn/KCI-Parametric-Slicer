@@ -3,6 +3,7 @@ import FreeCADGui as Gui
 import Part
 from typing import List, Tuple, Optional
 from enum import Enum
+import math
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -24,7 +25,7 @@ class SliceAxis(Enum):
 class KCIParametricNURBSSurface:
     """
     KCI NURBS Yüzey Oluşturucu - Mesh yüzeyine yapışan NURBS yüzey oluşturur
-    Spline eğrileri kullanarak yüzeyi mesh'in üzerine sarıyor
+    Geliştirilmiş eğri işleme ve smoothing ile
     """
     
     def __init__(self):
@@ -159,9 +160,17 @@ class KCIParametricNURBSSurface:
         self.v_degree_spin.setToolTip("V yönü spline derecesi (1-5)")
         layout.addRow("V Yönü Derece:", self.v_degree_spin)
         
+        # Smoothing katsayısı
+        self.smooth_factor_spin = QtWidgets.QDoubleSpinBox()
+        self.smooth_factor_spin.setRange(0.0, 1.0)
+        self.smooth_factor_spin.setValue(0.3)
+        self.smooth_factor_spin.setSingleStep(0.1)
+        self.smooth_factor_spin.setToolTip("Eğri düzeltme oranı (0=yok, 1=maksimum)")
+        layout.addRow("Eğri Düzeltme (%):", self.smooth_factor_spin)
+        
         # Parazit nokta filtreleme
         self.filter_outliers_check = QtWidgets.QCheckBox("Parazit Noktaları Filtrele")
-        self.filter_outliers_check.setChecked(False)
+        self.filter_outliers_check.setChecked(True)
         self.filter_outliers_check.setToolTip("Izole noktaları ve gürültüyü kaldır")
         layout.addRow("", self.filter_outliers_check)
         
@@ -290,15 +299,75 @@ class KCIParametricNURBSSurface:
         
         filtered = []
         for p in points:
-            # Minimum 1 komşu varsa noktayı tut
             neighbors = sum(1 for q in points if q.distanceToPoint(p) < threshold and p != q)
             if neighbors >= 1 or len(points) < 10:
                 filtered.append(p)
         
         return filtered if filtered else points
     
+    def _smooth_curve_points(self, points: List[App.Vector], factor: float) -> List[App.Vector]:
+        """Eğri noktalarını Laplacian smoothing ile düzelt"""
+        if len(points) < 3 or factor <= 0:
+            return points
+        
+        smoothed = [points[0]]  # İlk nokta sabit
+        
+        for i in range(1, len(points) - 1):
+            # Laplacian smoothing: yeni_nokta = nokta + factor * (komşu_ortalaması - nokta)
+            neighbor_avg = points[i-1] + points[i+1]
+            neighbor_avg.multiply(0.5)
+            
+            smoothed_point = points[i] * (1 - factor) + neighbor_avg * factor
+            smoothed.append(smoothed_point)
+        
+        smoothed.append(points[-1])  # Son nokta sabit
+        return smoothed
+    
+    def _resample_curve_to_length(self, points: List[App.Vector], min_points: int = 30) -> List[App.Vector]:
+        """Eğri noktalarını düzgün aralıkla yeniden örnekle"""
+        if len(points) < 2:
+            return points
+        
+        # Eğri uzunluğunu hesapla
+        total_length = 0.0
+        for i in range(len(points) - 1):
+            total_length += points[i].distanceToPoint(points[i+1])
+        
+        if total_length < 0.001:
+            return points
+        
+        # Minimum nokta sayısı garantisi
+        target_points = max(min_points, len(points))
+        step_length = total_length / (target_points - 1) if target_points > 1 else total_length
+        
+        resampled = [points[0]]
+        current_dist = 0.0
+        target_dist = step_length
+        
+        for i in range(len(points) - 1):
+            p1 = points[i]
+            p2 = points[i+1]
+            segment_length = p1.distanceToPoint(p2)
+            
+            if segment_length < 0.001:
+                continue
+            
+            while current_dist + segment_length >= target_dist:
+                t = (target_dist - current_dist) / segment_length
+                new_point = p1 + (p2 - p1) * t
+                resampled.append(new_point)
+                target_dist += step_length
+            
+            current_dist += segment_length
+        
+        # Son noktayı ekle
+        if resampled[-1].distanceToPoint(points[-1]) > 0.001:
+            resampled.append(points[-1])
+        
+        return resampled
+    
     def _create_spline_curve(self, points: List[App.Vector]) -> Optional[Part.BSplineCurve]:
-        """Noktalardan B-spline eğrisi oluştur"""
+        """Noktalardan B-spline eğrisi oluştur - geliştirilmiş version"""
         try:
             if len(points) < 3:
                 return None
@@ -306,6 +375,17 @@ class KCIParametricNURBSSurface:
             # Parazit noktaları filtrele
             if self.filter_outliers_check.isChecked():
                 points = self._filter_outliers(points)
+            
+            if len(points) < 3:
+                return None
+            
+            # Eğri noktalarını düzelt (smoothing)
+            smooth_factor = self.smooth_factor_spin.value()
+            if smooth_factor > 0:
+                points = self._smooth_curve_points(points, smooth_factor)
+            
+            # Eğri noktalarını yeniden örnekle (minimum 30 nokta)
+            points = self._resample_curve_to_length(points, min_points=30)
             
             if len(points) < 3:
                 return None
@@ -328,7 +408,7 @@ class KCIParametricNURBSSurface:
     
     def _create_nurbs_surface_from_curves(self, curves: List[Part.BSplineCurve], 
                                          doc: App.Document) -> Optional[object]:
-        """B-spline eğrilerinden NURBS yüzey oluştur - FİKS VERSION"""
+        """B-spline eğrilerinden NURBS yüzey oluştur"""
         try:
             if len(curves) < 3:
                 App.Console.PrintWarning(f"Yeterli eğri yok: {len(curves)}\n")
@@ -338,8 +418,8 @@ class KCIParametricNURBSSurface:
             u_degree = min(self.u_degree_spin.value(), len(curves) - 1)
             v_degree = self.v_degree_spin.value()
             
-            # Tüm eğrilerden eşit nokta sayısı al (ÖNEMLİ!)
-            num_v_points = 25  # Her eğriden 25 nokta al
+            # Tüm eğrilerden eşit nokta sayısı al
+            num_v_points = 35  # Her eğriden 35 nokta al (daha yüksek çözünürlük)
             
             all_points = []
             for curve in curves:
@@ -402,7 +482,7 @@ class KCIParametricNURBSSurface:
         return SliceAxis[axis_text.split("-")[0]]
     
     def save_document(self):
-        """Belgesi kaydet - güvenli şekilde"""
+        """Belgesi kaydet"""
         try:
             doc = App.ActiveDocument
             if doc is None:
@@ -429,7 +509,7 @@ class KCIParametricNURBSSurface:
             QtWidgets.QMessageBox.warning(None, "Uyarı", f"Geri alma başarısız:\n{str(e)}")
     
     def generate_nurbs_surface(self):
-        """Ana NURBS yüzey oluşturma fonksiyonu"""
+        """Ana NURBS yüzey oluşturma fonksiyonu - geliştirilmiş version"""
         try:
             axis = self._get_current_axis()
             
@@ -454,8 +534,9 @@ class KCIParametricNURBSSurface:
             
             all_spline_curves = []
             
-            App.Console.PrintMessage(f"\nKCI NURBS Oluşturma Başlıyor...\n")
+            App.Console.PrintMessage(f"\n=== KCI NURBS Oluşturma Başlıyor ===\n")
             App.Console.PrintMessage(f"Eksen: {axis.value}, Kesit Sayısı: {num_sections}\n")
+            App.Console.PrintMessage(f"Eğri Düzeltme: %{self.smooth_factor_spin.value()*100:.0f}\n")
             
             # Her kesit düzlemi için spline eğrisi oluştur
             for idx in range(num_sections):
@@ -530,7 +611,7 @@ class KCIParametricNURBSSurface:
                     spline = self._create_spline_curve(best_curve_points)
                     if spline:
                         all_spline_curves.append(spline)
-                        App.Console.PrintMessage(f"Kesit {idx+1}/{num_sections} - Eğri oluşturuldu ({len(best_curve_points)} nokta)\n")
+                        App.Console.PrintMessage(f"Kesit {idx+1}/{num_sections} ✓ Eğri oluşturuldu\n")
             
             App.Console.PrintMessage(f"\nToplam {len(all_spline_curves)} eğri oluşturuldu\n")
             
@@ -553,7 +634,9 @@ class KCIParametricNURBSSurface:
                         None, "✓ KCI Başarılı",
                         f"İşlem tamamlandı!\n\n"
                         f"{len(all_spline_curves)} kesit eğrisinden\n"
-                        f"NURBS yüzeyi başarıyla oluşturuldu."
+                        f"NURBS yüzeyi başarıyla oluşturuldu.\n\n"
+                        f"Eğriler otomatik düzeltildi ve\n"
+                        f"yeniden örneklendi (30+ nokta)."
                     )
                     App.Console.PrintMessage("✓ NURBS yüzeyi başarıyla oluşturuldu!\n")
                 else:
@@ -568,9 +651,9 @@ class KCIParametricNURBSSurface:
                     f"Yeterli kesit eğrisi bulunamadı\n"
                     f"Bulundu: {len(all_spline_curves)}, Gerekli: 3\n\n"
                     f"Çözüm:\n"
-                    f"• Koridor Toleransını artırın\n"
-                    f"• Arama Yarıçapını artırın\n"
-                    f"• Bastırma Mesafesini azaltın"
+                    f"• Koridor Toleransını artırın (2.5-3.0)\n"
+                    f"• Arama Yarıçapını artırın (10-12)\n"
+                    f"• Bastırma Mesafesini azaltın (1.0-2.0)"
                 )
             
         except Exception as e:
