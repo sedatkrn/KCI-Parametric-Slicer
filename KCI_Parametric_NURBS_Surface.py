@@ -110,31 +110,24 @@ class KCIParametricNURBSSurface:
         self.axis_combo.addItems(["X-Ekseni", "Y-Ekseni", "Z-Ekseni"])
         layout.addRow("Kesit Ekseni:", self.axis_combo)
         
-        # U-Yönü (Kesit sayısı) - Y veya X
+        # U-Yönü (Kesit sayısı)
         self.u_count_spin = QtWidgets.QSpinBox()
         self.u_count_spin.setRange(3, 50)
-        self.u_count_spin.setValue(12)
+        self.u_count_spin.setValue(15)
         self.u_count_spin.setToolTip("Eksen yönündeki kesit sayısı")
         layout.addRow("U Yönü - Kesit Sayısı:", self.u_count_spin)
-        
-        # V-Yönü (Eğri üstündeki nokta sayısı)
-        self.v_count_spin = QtWidgets.QSpinBox()
-        self.v_count_spin.setRange(3, 100)
-        self.v_count_spin.setValue(20)
-        self.v_count_spin.setToolTip("Her kesit üstündeki nokta sayısı")
-        layout.addRow("V Yönü - Nokta Sayısı:", self.v_count_spin)
         
         # Koridor toleransı
         self.tol_spin = QtWidgets.QDoubleSpinBox()
         self.tol_spin.setRange(0.05, 10.0)
-        self.tol_spin.setValue(1.5)
+        self.tol_spin.setValue(2.0)
         self.tol_spin.setToolTip("Kesit düzleminin genişliği")
         layout.addRow("Koridor Toleransı (mm):", self.tol_spin)
         
         # Arama yarıçapı
         self.radius_spin = QtWidgets.QDoubleSpinBox()
         self.radius_spin.setRange(0.5, 50.0)
-        self.radius_spin.setValue(6.0)
+        self.radius_spin.setValue(8.0)
         self.radius_spin.setToolTip("Nokta arama mesafesi")
         layout.addRow("Maksimum Arama Yarıçapı (mm):", self.radius_spin)
         
@@ -148,7 +141,7 @@ class KCIParametricNURBSSurface:
         # Bastırma mesafesi
         self.step_spin = QtWidgets.QDoubleSpinBox()
         self.step_spin.setRange(0.1, 20.0)
-        self.step_spin.setValue(2.0)
+        self.step_spin.setValue(1.5)
         self.step_spin.setToolTip("Düğümler arasında minimum mesafe")
         layout.addRow("Bastırma Mesafesi (mm):", self.step_spin)
         
@@ -168,18 +161,13 @@ class KCIParametricNURBSSurface:
         
         # Parazit nokta filtreleme
         self.filter_outliers_check = QtWidgets.QCheckBox("Parazit Noktaları Filtrele")
-        self.filter_outliers_check.setChecked(True)
+        self.filter_outliers_check.setChecked(False)
         self.filter_outliers_check.setToolTip("Izole noktaları ve gürültüyü kaldır")
         layout.addRow("", self.filter_outliers_check)
         
-        # Yüzey düşletme
-        self.smooth_check = QtWidgets.QCheckBox("Yüzey Düzeltmesi Uygula")
-        self.smooth_check.setChecked(True)
-        layout.addRow("", self.smooth_check)
-        
         # Otomatik kaydet
         self.auto_save_check = QtWidgets.QCheckBox("İşlem Sonrası Otomatik Kaydet")
-        self.auto_save_check.setChecked(True)
+        self.auto_save_check.setChecked(False)
         layout.addRow("", self.auto_save_check)
         
         return group
@@ -283,23 +271,28 @@ class KCIParametricNURBSSurface:
         else:
             return abs(v.z - target_val) <= tolerance
     
-    def _filter_outliers(self, points: List[App.Vector], axis: SliceAxis) -> List[App.Vector]:
+    def _filter_outliers(self, points: List[App.Vector]) -> List[App.Vector]:
         """Parazit ve izole noktaları filtrele"""
         if len(points) < 5:
             return points
         
-        # Her nokta için komşu sayısını hesapla
-        min_radius = max([
-            self.bbox.XLength, 
-            self.bbox.YLength, 
-            self.bbox.ZLength
-        ]) * 0.05
+        # Ortalama mesafeyi hesapla
+        distances = []
+        for i, p in enumerate(points):
+            for q in points[i+1:]:
+                distances.append(p.distanceToPoint(q))
+        
+        if not distances:
+            return points
+        
+        avg_dist = sum(distances) / len(distances)
+        threshold = avg_dist * 2
         
         filtered = []
         for p in points:
-            # Minimum 2 komşu varsa noktayı tut
-            neighbors = sum(1 for q in points if q.distanceToPoint(p) < min_radius and p != q)
-            if neighbors >= 2 or len(points) < 10:
+            # Minimum 1 komşu varsa noktayı tut
+            neighbors = sum(1 for q in points if q.distanceToPoint(p) < threshold and p != q)
+            if neighbors >= 1 or len(points) < 10:
                 filtered.append(p)
         
         return filtered if filtered else points
@@ -312,7 +305,7 @@ class KCIParametricNURBSSurface:
             
             # Parazit noktaları filtrele
             if self.filter_outliers_check.isChecked():
-                points = self._filter_outliers(points, self._get_current_axis())
+                points = self._filter_outliers(points)
             
             if len(points) < 3:
                 return None
@@ -325,29 +318,48 @@ class KCIParametricNURBSSurface:
             App.Console.PrintWarning(f"Spline oluşturulamadı: {str(e)}\n")
             return None
     
+    def _resample_curve_points(self, curve: Part.BSplineCurve, num_points: int) -> List[App.Vector]:
+        """Eğri üzerinden eşit aralıklı noktalar al"""
+        points = []
+        for i in range(num_points):
+            param = i / (num_points - 1) if num_points > 1 else 0
+            points.append(curve.valueAt(param))
+        return points
+    
     def _create_nurbs_surface_from_curves(self, curves: List[Part.BSplineCurve], 
                                          doc: App.Document) -> Optional[object]:
-        """B-spline eğrilerinden NURBS yüzey oluştur"""
+        """B-spline eğrilerinden NURBS yüzey oluştur - FİKS VERSION"""
         try:
             if len(curves) < 3:
+                App.Console.PrintWarning(f"Yeterli eğri yok: {len(curves)}\n")
                 return None
             
-            # Eğrileri yüzeye dönüştür
+            # Yüzey parametreleri
             u_degree = min(self.u_degree_spin.value(), len(curves) - 1)
             v_degree = self.v_degree_spin.value()
             
-            nurbs_surface = Part.BSplineSurface()
+            # Tüm eğrilerden eşit nokta sayısı al (ÖNEMLİ!)
+            num_v_points = 25  # Her eğriden 25 nokta al
             
-            # Tüm eğrilerin noktalarını al
             all_points = []
             for curve in curves:
-                points = []
-                for i in range(self.v_count_spin.value()):
-                    param = i / (self.v_count_spin.value() - 1) if self.v_count_spin.value() > 1 else 0
-                    points.append(curve.valueAt(param))
-                all_points.append(points)
+                try:
+                    points = self._resample_curve_points(curve, num_v_points)
+                    if len(points) == num_v_points:
+                        all_points.append(points)
+                except Exception as e:
+                    App.Console.PrintWarning(f"Eğri resample başarısız: {str(e)}\n")
+                    continue
+            
+            # Yeterli eğri kontrol et
+            if len(all_points) < 3:
+                App.Console.PrintWarning(f"Geçerli eğri sayısı çok az: {len(all_points)}\n")
+                return None
+            
+            App.Console.PrintMessage(f"NURBS Yüzey Oluşturuluyor: {len(all_points)}x{num_v_points} noktalar\n")
             
             # NURBS yüzey oluştur
+            nurbs_surface = Part.BSplineSurface()
             nurbs_surface.interpolate(all_points, u_degree, v_degree)
             
             # Yüzey nesnesini belgede oluştur
@@ -357,7 +369,7 @@ class KCIParametricNURBSSurface:
             return surface_obj
             
         except Exception as e:
-            App.Console.PrintWarning(f"NURBS yüzey oluşturulamadı: {str(e)}\n")
+            App.Console.PrintError(f"NURBS yüzey oluşturulamadı: {str(e)}\n")
             return None
     
     def _select_best_candidate(self, candidates: List[Tuple[App.Vector, float]], 
@@ -442,6 +454,9 @@ class KCIParametricNURBSSurface:
             
             all_spline_curves = []
             
+            App.Console.PrintMessage(f"\nKCI NURBS Oluşturma Başlıyor...\n")
+            App.Console.PrintMessage(f"Eksen: {axis.value}, Kesit Sayısı: {num_sections}\n")
+            
             # Her kesit düzlemi için spline eğrisi oluştur
             for idx in range(num_sections):
                 target_val = start_pos + (idx * step_pos)
@@ -460,7 +475,6 @@ class KCIParametricNURBSSurface:
                 
                 # Adım 2: En büyük eğriyi bul
                 best_curve_points = []
-                best_curve_length = 0
                 
                 while len(unvisited) >= 3:
                     initial_pool_size = len(unvisited)
@@ -512,25 +526,20 @@ class KCIParametricNURBSSurface:
                         unvisited.remove(start_node)
                 
                 # Eğri yeterli nokta içeriyorsa spline oluştur
-                if len(best_curve_points) >= 3:
+                if len(best_curve_points) >= 4:
                     spline = self._create_spline_curve(best_curve_points)
                     if spline:
                         all_spline_curves.append(spline)
+                        App.Console.PrintMessage(f"Kesit {idx+1}/{num_sections} - Eğri oluşturuldu ({len(best_curve_points)} nokta)\n")
+            
+            App.Console.PrintMessage(f"\nToplam {len(all_spline_curves)} eğri oluşturuldu\n")
             
             # Adım 4: NURBS yüzey oluştur
             if len(all_spline_curves) >= 3:
+                App.Console.PrintMessage(f"NURBS yüzey oluşturuluyor...\n")
                 surface = self._create_nurbs_surface_from_curves(all_spline_curves, doc)
                 
                 if surface:
-                    # Yüzey düzeltmesi uygula
-                    if self.smooth_check.isChecked():
-                        try:
-                            # Mesh'e dönüştür ve geri dönüştür (düzeltme işlemi)
-                            mesh = surface.Shape.toMesh(0.5)
-                            surface.Shape = mesh.toShape()
-                        except:
-                            pass
-                    
                     doc.recompute()
                     doc.commitTransaction()
                     
@@ -541,20 +550,27 @@ class KCIParametricNURBSSurface:
                     Gui.Control.closeDialog()
                     
                     QtWidgets.QMessageBox.information(
-                        None, "KCI Başarılı",
-                        f"İşlem tamamlandı!\n"
+                        None, "✓ KCI Başarılı",
+                        f"İşlem tamamlandı!\n\n"
                         f"{len(all_spline_curves)} kesit eğrisinden\n"
-                        f"NURBS yüzeyi oluşturuldu."
+                        f"NURBS yüzeyi başarıyla oluşturuldu."
                     )
+                    App.Console.PrintMessage("✓ NURBS yüzeyi başarıyla oluşturuldu!\n")
                 else:
                     doc.abortTransaction()
                     QtWidgets.QMessageBox.warning(
-                        None, "Uyarı", "NURBS yüzey oluşturulamadı"
+                        None, "✗ Hata", "NURBS yüzey oluşturulamadı - Lütfen parametreleri kontrol edin"
                     )
             else:
                 doc.abortTransaction()
                 QtWidgets.QMessageBox.warning(
-                    None, "Uyarı", f"Yeterli kesit eğrisi bulunamadı ({len(all_spline_curves)})"
+                    None, "✗ Yeterli Eğri Yok", 
+                    f"Yeterli kesit eğrisi bulunamadı\n"
+                    f"Bulundu: {len(all_spline_curves)}, Gerekli: 3\n\n"
+                    f"Çözüm:\n"
+                    f"• Koridor Toleransını artırın\n"
+                    f"• Arama Yarıçapını artırın\n"
+                    f"• Bastırma Mesafesini azaltın"
                 )
             
         except Exception as e:
@@ -566,7 +582,9 @@ class KCIParametricNURBSSurface:
                 pass
             
             App.Console.PrintError(f"KCI Hata: {str(e)}\n")
-            QtWidgets.QMessageBox.critical(None, "Hata", f"İşlem başarısız:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(None, "✗ Kritik Hata", f"İşlem başarısız:\n{str(e)}")
     
     def getStandardButtons(self):
         """Dialog butonlarını döndür"""
